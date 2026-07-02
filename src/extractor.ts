@@ -23,11 +23,15 @@ const URGENCIES = new Set(["low", "medium", "high"]);
 export function validateExtraction(raw: unknown): Extraction {
   // LLM output is untrusted input. Validate the shape before it touches the
   // database; a validation failure is a job failure, which retries and can
-  // dead-letter. Never store garbage.
+  // dead-letter. Never store garbage. Type checks come before membership
+  // checks: String(["negative"]) === "negative", so coercion would let an
+  // array masquerade as a valid enum value.
   const obj = raw as Record<string, unknown>;
   if (typeof obj !== "object" || obj === null) throw new Error("extraction: not an object");
-  if (!SENTIMENTS.has(String(obj.sentiment))) throw new Error(`extraction: bad sentiment '${obj.sentiment}'`);
-  if (!URGENCIES.has(String(obj.urgency))) throw new Error(`extraction: bad urgency '${obj.urgency}'`);
+  if (typeof obj.sentiment !== "string" || !SENTIMENTS.has(obj.sentiment))
+    throw new Error(`extraction: bad sentiment '${obj.sentiment}'`);
+  if (typeof obj.urgency !== "string" || !URGENCIES.has(obj.urgency))
+    throw new Error(`extraction: bad urgency '${obj.urgency}'`);
   if (!Array.isArray(obj.feature_requests) || !obj.feature_requests.every((f) => typeof f === "string"))
     throw new Error("extraction: feature_requests must be string[]");
   if (!Array.isArray(obj.competitor_mentions) || !obj.competitor_mentions.every((c) => typeof c === "string"))
@@ -92,7 +96,12 @@ export class AnthropicExtractor implements Extractor {
   private async getClient() {
     if (!this.client) {
       const { default: Anthropic } = await import("@anthropic-ai/sdk");
-      this.client = new Anthropic();
+      // Bounded provider calls: a hung request fails the job (which retries
+      // with backoff) instead of stalling the worker loop indefinitely.
+      this.client = new Anthropic({
+        timeout: Number(process.env.EXTRACTION_TIMEOUT_MS ?? 30_000),
+        maxRetries: 0, // retries belong to the queue, not the HTTP client
+      });
     }
     return this.client;
   }
@@ -109,9 +118,17 @@ export class AnthropicExtractor implements Extractor {
       .filter((b): b is { type: "text"; text: string } => b.type === "text")
       .map((b) => b.text)
       .join("");
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (!jsonMatch) throw new Error("extraction: no JSON in model response");
-    return validateExtraction({ ...JSON.parse(jsonMatch[0]), model: this.modelId });
+    // Prefer parsing the whole response; fall back to brace extraction for
+    // models that wrap JSON in prose.
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text);
+    } catch {
+      const jsonMatch = text.match(/\{[\s\S]*\}/);
+      if (!jsonMatch) throw new Error("extraction: no JSON in model response");
+      parsed = JSON.parse(jsonMatch[0]);
+    }
+    return validateExtraction({ ...(parsed as object), model: this.modelId });
   }
 }
 

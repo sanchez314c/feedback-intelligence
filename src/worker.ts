@@ -7,7 +7,10 @@ import type { Extractor } from "./extractor.js";
 // which retries up to the cap and then dead-letters. The worker never crashes
 // the process over one bad submission.
 
-export async function processOne(db: Database.Database, extractor: Extractor): Promise<boolean> {
+export async function processOne(
+  db: Database.Database,
+  extractor: Extractor
+): Promise<"done" | "failed" | false> {
   const job = claimNextJob(db);
   if (!job) return false;
 
@@ -17,7 +20,7 @@ export async function processOne(db: Database.Database, extractor: Extractor): P
 
   if (!sub) {
     failJob(db, job, "submission row missing");
-    return true;
+    return "failed";
   }
 
   try {
@@ -35,17 +38,24 @@ export async function processOne(db: Database.Database, extractor: Extractor): P
       ex.model
     );
     completeJob(db, job.id);
+    return "done";
   } catch (err) {
     const state = failJob(db, job, err instanceof Error ? err.message : String(err));
     console.error(`[worker] job ${job.id} attempt ${job.attempts} failed → ${state}:`, err);
+    return "failed";
   }
-  return true;
 }
 
+// Returns the number of jobs COMPLETED (a job retried twice then done counts
+// once; a dead-lettered job counts zero).
 export async function drainQueue(db: Database.Database, extractor: Extractor): Promise<number> {
-  let processed = 0;
-  while (await processOne(db, extractor)) processed++;
-  return processed;
+  let completed = 0;
+  for (;;) {
+    const result = await processOne(db, extractor);
+    if (result === false) break;
+    if (result === "done") completed++;
+  }
+  return completed;
 }
 
 export function startWorkerLoop(db: Database.Database, extractor: Extractor, intervalMs = 3000): NodeJS.Timeout {
@@ -55,6 +65,10 @@ export function startWorkerLoop(db: Database.Database, extractor: Extractor, int
     running = true;
     try {
       await drainQueue(db, extractor);
+    } catch (err) {
+      // A throw outside processOne's try (e.g. SQLITE_BUSY on claim) must not
+      // become an unhandled rejection that kills the server.
+      console.error("[worker] drain error:", err);
     } finally {
       running = false;
     }

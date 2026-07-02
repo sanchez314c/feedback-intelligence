@@ -6,6 +6,8 @@ import { MockExtractor, validateExtraction, type Extractor } from "../src/extrac
 import { drainQueue } from "../src/worker.js";
 import { runAggregation } from "../src/aggregate.js";
 
+process.env.RETRY_BACKOFF_SECONDS = "0";
+
 let db: Database.Database;
 beforeEach(() => {
   db = createDb(":memory:");

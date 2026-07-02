@@ -1,10 +1,16 @@
 import Database from "better-sqlite3";
+import { fileURLToPath } from "node:url";
+import { dirname, join } from "node:path";
 
 // SQLite keeps this demo runnable with zero infrastructure. In production this
 // layer maps to Postgres: same schema, same write-first durability guarantee.
 // WAL mode gives us crash-safe durability for the "we can't lose feedback" requirement.
 
-export function createDb(path = process.env.DB_PATH ?? "feedback.db"): Database.Database {
+// Anchor the default DB next to the project, not the process cwd, so launching
+// from any directory finds the same data.
+const DEFAULT_DB = join(dirname(fileURLToPath(import.meta.url)), "..", "feedback.db");
+
+export function createDb(path = process.env.DB_PATH ?? DEFAULT_DB): Database.Database {
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
   db.pragma("foreign_keys = ON");
@@ -37,9 +43,12 @@ function migrate(db: Database.Database): void {
         CHECK (status IN ('queued','processing','done','dead')),
       attempts INTEGER NOT NULL DEFAULT 0,
       last_error TEXT,
+      -- Earliest time this job may be claimed. Failed jobs get exponential
+      -- backoff instead of hammering a failing provider in a tight loop.
+      next_attempt_at TEXT NOT NULL DEFAULT (datetime('now')),
       updated_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
-    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status);
+    CREATE INDEX IF NOT EXISTS idx_jobs_status ON jobs(status, next_attempt_at);
 
     -- Per-submission LLM extractions. Noisy by design; the aggregation pass
     -- normalizes them.

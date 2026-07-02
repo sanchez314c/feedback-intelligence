@@ -11,15 +11,17 @@ function normalizeFeature(raw: string): string {
   // In production this step is itself an LLM call that clusters phrases;
   // the interface stays identical.
   let f = raw.toLowerCase().trim();
+  // Word-boundary anchored: without \b, "payment processor" matches /sso/ and
+  // pollutes the aggregate with feature requests nobody made.
   const synonyms: [RegExp, string][] = [
-    [/dark (mode|theme)|night mode/, "dark mode"],
-    [/(salesforce|sfdc|crm) (integration|sync|connector)/, "crm integration"],
-    [/(api|webhook)s? (access|support|integration)?/, "public api"],
-    [/(export|download) (to )?(csv|excel|report)s?/, "data export"],
-    [/sso|single sign.?on|saml|okta/, "sso"],
-    [/(voice|call) (analytics|insights|transcri\w+)/, "voice analytics"],
-    [/dashboard|reporting|analytics page/, "better reporting"],
-    [/multi.?language|localization|german|spanish/, "multi-language support"],
+    [/\bdark (mode|theme)\b|\bnight mode\b/, "dark mode"],
+    [/\b(salesforce|sfdc|crm) (integration|sync|connector)\b/, "crm integration"],
+    [/\b(api|webhook)s? (access|support|integration)\b/, "public api"],
+    [/\b(export|download) (to )?(csv|excel|report)s?\b/, "data export"],
+    [/\bsso\b|\bsingle sign.?on\b|\bsaml\b|\bokta\b/, "sso"],
+    [/\b(voice|call) (analytics|insights|transcri\w+)\b/, "voice analytics"],
+    [/\bdashboard\b|\breporting\b|\banalytics page\b/, "better reporting"],
+    [/\bmulti.?language\b|\blocalization\b|\bgerman\b|\bspanish\b/, "multi-language support"],
   ];
   for (const [pattern, canonical] of synonyms) {
     if (pattern.test(f)) return canonical;
@@ -39,7 +41,8 @@ export function runAggregation(db: Database.Database): {
     .prepare(
       `SELECT e.sentiment, e.feature_requests, e.competitor_mentions, e.urgency,
               s.customer_id, s.account_name, s.segment, s.topic, s.received_at
-       FROM extractions e JOIN submissions s ON s.id = e.submission_id`
+       FROM extractions e JOIN submissions s ON s.id = e.submission_id
+       ORDER BY s.received_at ASC`
     )
     .all() as {
     sentiment: string;
@@ -89,6 +92,10 @@ export function runAggregation(db: Database.Database): {
       urgent: 0,
       competitor: false,
     };
+    // Latest-seen metadata wins: a renamed account or segment change should
+    // not report stale values forever (rows arrive ordered by received_at).
+    cust.account_name = r.account_name;
+    cust.segment = r.segment;
     if (r.sentiment === "negative") cust.neg++;
     if (r.urgency === "high") cust.urgent++;
     if ((JSON.parse(r.competitor_mentions) as string[]).length > 0) cust.competitor = true;
@@ -126,7 +133,16 @@ export function runAggregation(db: Database.Database): {
 }
 
 function isoWeek(dateStr: string): string {
-  const d = new Date(dateStr + (dateStr.includes("T") ? "" : "T00:00:00Z"));
+  // SQLite datetime('now') emits "YYYY-MM-DD HH:MM:SS" (space, no zone) which
+  // Date() either rejects or parses as LOCAL time depending on shape. Normalize
+  // to an explicit UTC ISO string before parsing: bare dates get midnight,
+  // space-separated datetimes get the T and a Z.
+  const iso = dateStr.includes("T")
+    ? dateStr
+    : dateStr.includes(" ")
+      ? dateStr.replace(" ", "T") + "Z"
+      : dateStr + "T00:00:00Z";
+  const d = new Date(iso);
   const target = new Date(Date.UTC(d.getUTCFullYear(), d.getUTCMonth(), d.getUTCDate()));
   const dayNum = (target.getUTCDay() + 6) % 7;
   target.setUTCDate(target.getUTCDate() - dayNum + 3);
@@ -136,5 +152,12 @@ function isoWeek(dateStr: string): string {
 }
 
 export function startAggregationLoop(db: Database.Database, intervalMs = 24 * 60 * 60 * 1000): NodeJS.Timeout {
-  return setInterval(() => runAggregation(db), intervalMs);
+  return setInterval(() => {
+    try {
+      runAggregation(db);
+    } catch (err) {
+      // One bad daily tick must never kill the server (and with it, ingestion).
+      console.error("[aggregate] scheduled run failed:", err);
+    }
+  }, intervalMs);
 }

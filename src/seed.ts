@@ -1,14 +1,23 @@
 import { createDb } from "./db.js";
 import { enqueueSubmission } from "./queue.js";
+import { makeToken } from "./token.js";
 import { buildExtractor } from "./extractor.js";
 import { drainQueue } from "./worker.js";
 import { runAggregation } from "./aggregate.js";
 
 // Seeds ~40 realistic submissions across segments, runs the full pipeline
 // (ingest → extract → aggregate) so the dashboard is populated on first run.
+// Refuses to run against a non-empty database (pass --force to override) so a
+// careless rerun can't duplicate or re-date real data.
 
 const db = createDb();
 const extractor = buildExtractor();
+
+const existing = (db.prepare(`SELECT COUNT(*) as n FROM submissions`).get() as { n: number }).n;
+if (existing > 0 && !process.argv.includes("--force")) {
+  console.error(`refusing to seed: ${existing} submissions already exist (use --force to append anyway)`);
+  process.exit(1);
+}
 
 const ACCOUNTS = [
   { customer_id: "cust-001", account_name: "Nordwind Insurance", segment: "enterprise" },
@@ -46,24 +55,26 @@ const FEEDBACK: { topic: string; body: string }[] = [
   { topic: "Competitive", body: "Decagon demoed for our support org. We are staying with you for now but their summarization feature is something we wish you had." },
 ];
 
-let seeded = 0;
+const insertedIds: number[] = [];
 for (let i = 0; i < 40; i++) {
   const account = ACCOUNTS[i % ACCOUNTS.length];
   const fb = FEEDBACK[i % FEEDBACK.length];
-  enqueueSubmission(db, {
-    token: `tok-${account.customer_id}-${i}`,
+  const { submissionId } = enqueueSubmission(db, {
+    // Real signed tokens, same code path production links would use.
+    token: makeToken(account),
     ...account,
     ...fb,
   });
-  seeded++;
+  insertedIds.push(submissionId);
 }
+const seeded = insertedIds.length;
 
 // Spread received_at over the past 10 weeks so the sentiment trend has shape.
-const subs = db.prepare(`SELECT id FROM submissions ORDER BY id`).all() as { id: number }[];
+// Only touches the rows inserted by THIS run.
 const update = db.prepare(`UPDATE submissions SET received_at = datetime('now', ?) WHERE id = ?`);
-subs.forEach((s, idx) => {
-  const daysAgo = Math.floor((idx / subs.length) * 70);
-  update.run(`-${daysAgo} days`, s.id);
+insertedIds.forEach((id, idx) => {
+  const daysAgo = Math.floor((idx / insertedIds.length) * 70);
+  update.run(`-${daysAgo} days`, id);
 });
 
 console.log(`seeded ${seeded} submissions, processing...`);
@@ -73,3 +84,5 @@ const agg = runAggregation(db);
 console.log(`aggregated: ${agg.themes} themes, ${agg.features} normalized feature requests, ${agg.atRisk} at-risk accounts`);
 db.close();
 console.log(`done. run: npm start  →  http://localhost:4400`);
+console.log(`sample tokenized feedback link (what a customer receives):`);
+console.log(`  http://localhost:4400/form?token=${encodeURIComponent(makeToken(ACCOUNTS[0]))}`);

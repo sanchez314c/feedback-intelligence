@@ -11,6 +11,9 @@ import {
   MAX_ATTEMPTS,
 } from "../src/queue.js";
 
+// Immediate retries in tests; the backoff-specific test overrides this.
+process.env.RETRY_BACKOFF_SECONDS = "0";
+
 const SUB = {
   token: "tok-test",
   customer_id: "cust-t1",

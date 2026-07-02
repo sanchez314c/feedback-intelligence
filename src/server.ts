@@ -3,7 +3,8 @@ import fastifyStatic from "@fastify/static";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
 import { createDb } from "./db.js";
-import { enqueueSubmission, reprocessDeadJobs, queueStats } from "./queue.js";
+import { enqueueSubmission, reprocessDeadJobs, recoverStaleJobs, queueStats } from "./queue.js";
+import { verifyToken } from "./token.js";
 import { buildExtractor } from "./extractor.js";
 import { startWorkerLoop, drainQueue } from "./worker.js";
 import { runAggregation, startAggregationLoop } from "./aggregate.js";
@@ -12,44 +13,87 @@ const __dirname = dirname(fileURLToPath(import.meta.url));
 const db = createDb();
 const extractor = buildExtractor();
 
-const app = Fastify({ logger: false });
+// Crash recovery: jobs stranded in 'processing' by a previous run requeue on boot.
+const recovered = recoverStaleJobs(db);
+if (recovered > 0) console.log(`[startup] recovered ${recovered} stale processing job(s)`);
+
+// 32KB is generous for a feedback form and starves payload abuse.
+const app = Fastify({ logger: false, bodyLimit: 32 * 1024 });
 await app.register(fastifyStatic, { root: join(__dirname, "..", "public") });
 
-const VALID_SEGMENTS = new Set(["enterprise", "mid-market", "smb"]);
+// The brief's topic dropdown, enforced server-side so arbitrary strings can't
+// pollute the themes aggregate.
+export const VALID_TOPICS = [
+  "Product Experience",
+  "Integrations",
+  "Pricing & Billing",
+  "Support",
+  "Competitive",
+] as const;
+const TOPIC_SET = new Set<string>(VALID_TOPICS);
+const MAX_BODY_CHARS = 5000;
 
-// Requirement 1: collect & store. Token resolves identity server-side (the
-// brief says no lookup needed at submission time, so the demo trusts a signed
-// token payload; production verifies an HMAC signature on it).
+// Optional bearer guard for admin actions. Unset = open (local demo);
+// set ADMIN_TOKEN and the mutating admin endpoints require it.
+function adminGuard(req: { headers: Record<string, unknown> }): boolean {
+  const required = process.env.ADMIN_TOKEN;
+  if (!required) return true;
+  return req.headers["authorization"] === `Bearer ${required}`;
+}
+
+// Requirement 1: collect & store. The token IS the identity: HMAC-verified,
+// minted when the outbound link was generated. The API never trusts
+// client-supplied identity fields — it accepts only token, topic, body.
 app.post("/api/feedback", async (req, reply) => {
-  const b = req.body as Record<string, string>;
-  for (const field of ["token", "customer_id", "account_name", "segment", "topic", "body"]) {
+  const b = req.body as Record<string, unknown>;
+  for (const field of ["token", "topic", "body"]) {
     if (!b?.[field] || typeof b[field] !== "string")
       return reply.code(400).send({ error: `missing or invalid field: ${field}` });
   }
-  if (!VALID_SEGMENTS.has(b.segment))
-    return reply.code(400).send({ error: "segment must be enterprise | mid-market | smb" });
+  const { token, topic, body } = b as { token: string; topic: string; body: string };
+  if (!TOPIC_SET.has(topic))
+    return reply.code(400).send({ error: `topic must be one of: ${VALID_TOPICS.join(", ")}` });
+  if (body.length > MAX_BODY_CHARS)
+    return reply.code(400).send({ error: `body exceeds ${MAX_BODY_CHARS} characters` });
+
+  let identity;
+  try {
+    identity = verifyToken(token);
+  } catch {
+    return reply.code(401).send({ error: "invalid or tampered token" });
+  }
 
   const { submissionId, jobId } = enqueueSubmission(db, {
-    token: b.token,
-    customer_id: b.customer_id,
-    account_name: b.account_name,
-    segment: b.segment,
-    topic: b.topic,
-    body: b.body,
+    token,
+    customer_id: identity.customer_id,
+    account_name: identity.account_name,
+    segment: identity.segment,
+    topic,
+    body,
   });
   // 202: stored durably, analysis happens async. The client never waits on an LLM.
   return reply.code(202).send({ submission_id: submissionId, job_id: jobId, status: "queued" });
 });
 
+// The customer-facing form from the brief: tokenized link → topic dropdown +
+// free text. The token rides the query string into the static form page.
+app.get("/form", async (_req, reply) => {
+  return reply.sendFile("form.html");
+});
+
 // Requirement 1 recovery path: reprocess dead-lettered jobs.
-app.post("/api/dlq/reprocess", async () => {
+app.post("/api/dlq/reprocess", async (req, reply) => {
+  if (!adminGuard(req)) return reply.code(401).send({ error: "unauthorized" });
   const requeued = reprocessDeadJobs(db);
   return { requeued };
 });
 
 // Requirement 3: on-demand aggregation (also runs daily on a timer).
-app.post("/api/aggregate", async () => {
-  await drainQueue(db, extractor); // flush anything pending first
+// Flushes claimable pending work first so "aggregate now" reflects everything
+// extractable; backoff keeps this bounded when the provider is failing.
+app.post("/api/aggregate", async (req, reply) => {
+  if (!adminGuard(req)) return reply.code(401).send({ error: "unauthorized" });
+  await drainQueue(db, extractor);
   return runAggregation(db);
 });
 
@@ -86,16 +130,25 @@ const workerTimer = startWorkerLoop(db, extractor);
 const aggTimer = startAggregationLoop(db);
 
 const port = Number(process.env.PORT ?? 4400);
-await app.listen({ port, host: "0.0.0.0" });
+// Localhost by default; set HOST=0.0.0.0 to expose deliberately.
+const host = process.env.HOST ?? "127.0.0.1";
+await app.listen({ port, host });
 console.log(`feedback-intelligence listening on http://localhost:${port}`);
 console.log(`extractor: ${process.env.ANTHROPIC_API_KEY ? "anthropic" : "mock (set ANTHROPIC_API_KEY for real LLM extraction)"}`);
 
+let shuttingDown = false;
 for (const sig of ["SIGINT", "SIGTERM"] as const) {
   process.on(sig, async () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
     clearInterval(workerTimer);
     clearInterval(aggTimer);
-    await app.close();
-    db.close();
+    try {
+      await app.close();
+      db.close();
+    } catch (err) {
+      console.error("[shutdown]", err);
+    }
     process.exit(0);
   });
 }
