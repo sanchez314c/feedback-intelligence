@@ -1,0 +1,137 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Feedback Intelligence</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0b0f14; color: #e8edf2;
+    font-family: -apple-system, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+    padding: 32px; max-width: 1200px; margin: 0 auto;
+  }
+  header { display: flex; justify-content: space-between; align-items: baseline; margin-bottom: 24px; }
+  h1 { font-size: 24px; letter-spacing: 1px; color: #4fd1c5; }
+  .meta { color: #8b98a5; font-size: 13px; }
+  .grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  .card { background: #111820; border: 1px solid #263445; border-radius: 12px; padding: 18px; }
+  .card h2 { font-size: 13px; letter-spacing: 2px; color: #4fd1c5; margin-bottom: 14px; text-transform: uppercase; }
+  .wide { grid-column: 1 / -1; }
+  table { width: 100%; border-collapse: collapse; font-size: 14px; }
+  th { text-align: left; color: #8b98a5; font-weight: 600; padding: 6px 8px; border-bottom: 1px solid #263445; font-size: 12px; }
+  td { padding: 7px 8px; border-bottom: 1px solid #161f29; }
+  .bar-row { display: flex; align-items: center; gap: 10px; padding: 5px 0; font-size: 14px; }
+  .bar-label { min-width: 220px; color: #dde5ec; }
+  .bar { height: 18px; background: #4fd1c5; border-radius: 4px; min-width: 4px; }
+  .bar.amber { background: #f0b429; }
+  .bar-n { color: #8b98a5; font-size: 13px; }
+  .risk-high { color: #ff9d95; font-weight: 700; }
+  .risk-med { color: #ffd66b; font-weight: 600; }
+  .pill { display: inline-block; padding: 1px 8px; border-radius: 10px; font-size: 11px; background: #1e2936; color: #9ecbff; margin-right: 4px; }
+  .trend { display: flex; align-items: flex-end; gap: 6px; height: 120px; padding-top: 8px; }
+  .week { display: flex; flex-direction: column-reverse; flex: 1; gap: 2px; }
+  .seg { width: 100%; border-radius: 2px; }
+  .seg.positive { background: #23c27f; }
+  .seg.neutral { background: #4a5766; }
+  .seg.negative { background: #d64545; }
+  .week-label { font-size: 10px; color: #4a5766; text-align: center; margin-top: 4px; }
+  .legend { font-size: 12px; color: #8b98a5; margin-top: 8px; }
+  .dot { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin: 0 4px 0 12px; vertical-align: middle; }
+  .empty { color: #4a5766; font-size: 14px; padding: 12px 0; }
+</style>
+</head>
+<body>
+<header>
+  <h1>FEEDBACK INTELLIGENCE</h1>
+  <div class="meta" id="meta">loading…</div>
+</header>
+
+<div class="grid">
+  <div class="card">
+    <h2>Themes (topic volume)</h2>
+    <div id="themes"><div class="empty">No data. Run npm run seed, then POST /api/aggregate.</div></div>
+  </div>
+
+  <div class="card">
+    <h2>Top Feature Requests (normalized)</h2>
+    <div id="features"><div class="empty">No data yet.</div></div>
+  </div>
+
+  <div class="card wide">
+    <h2>Sentiment Trend (weekly)</h2>
+    <div class="trend" id="trend"></div>
+    <div class="legend">
+      <span class="dot" style="background:#23c27f"></span>positive
+      <span class="dot" style="background:#4a5766"></span>neutral
+      <span class="dot" style="background:#d64545"></span>negative
+    </div>
+  </div>
+
+  <div class="card wide">
+    <h2>At-Risk Accounts</h2>
+    <table id="risk">
+      <thead><tr><th>Account</th><th>Segment</th><th>Negative</th><th>High urgency</th><th>Competitor mention</th><th>Risk score</th></tr></thead>
+      <tbody></tbody>
+    </table>
+  </div>
+</div>
+
+<script>
+async function load() {
+  const [trends, risk, health] = await Promise.all([
+    fetch("/api/trends").then(r => r.json()),
+    fetch("/api/at-risk").then(r => r.json()),
+    fetch("/api/health").then(r => r.json()),
+  ]);
+
+  document.getElementById("meta").textContent =
+    `extractor: ${health.extractor} · queue: ${Object.entries(health.queue).map(([k,v]) => k + " " + v).join(", ") || "empty"}`;
+
+  const themes = document.getElementById("themes");
+  if (trends.themes.length) {
+    const max = Math.max(...trends.themes.map(t => t.mentions));
+    themes.innerHTML = trends.themes.map(t =>
+      `<div class="bar-row"><span class="bar-label">${esc(t.theme)}</span>
+       <div class="bar" style="width:${(t.mentions / max) * 55}%"></div>
+       <span class="bar-n">${t.mentions}</span></div>`).join("");
+  }
+
+  const features = document.getElementById("features");
+  if (trends.top_feature_requests.length) {
+    const max = Math.max(...trends.top_feature_requests.map(f => f.requests));
+    features.innerHTML = trends.top_feature_requests.map(f =>
+      `<div class="bar-row"><span class="bar-label">${esc(f.feature)}</span>
+       <div class="bar amber" style="width:${(f.requests / max) * 45}%"></div>
+       <span class="bar-n">${f.requests}</span>
+       <span>${f.segments.map(s => `<span class="pill">${esc(s)}</span>`).join("")}</span></div>`).join("");
+  }
+
+  const byWeek = {};
+  for (const row of trends.sentiment_weekly) {
+    (byWeek[row.week] ??= {})[row.sentiment] = row.count;
+  }
+  const weeks = Object.keys(byWeek).sort();
+  const maxWeek = Math.max(1, ...weeks.map(w => Object.values(byWeek[w]).reduce((a,b) => a+b, 0)));
+  document.getElementById("trend").innerHTML = weeks.map(w => {
+    const c = byWeek[w];
+    const seg = s => c[s] ? `<div class="seg ${s}" style="height:${(c[s]/maxWeek)*100}px"></div>` : "";
+    return `<div style="flex:1"><div class="week">${seg("positive")}${seg("neutral")}${seg("negative")}</div>
+            <div class="week-label">${w.slice(5)}</div></div>`;
+  }).join("") || '<div class="empty">No data yet.</div>';
+
+  const tbody = document.querySelector("#risk tbody");
+  tbody.innerHTML = risk.map(r => {
+    const cls = r.risk_score >= 5 ? "risk-high" : "risk-med";
+    return `<tr><td>${esc(r.account_name)}</td><td>${esc(r.segment)}</td>
+      <td>${r.negative_count}</td><td>${r.high_urgency_count}</td>
+      <td>${r.competitor_mentioned ? "yes" : "no"}</td>
+      <td class="${cls}">${r.risk_score}</td></tr>`;
+  }).join("") || '<tr><td colspan="6" class="empty">No at-risk accounts.</td></tr>';
+}
+function esc(s) { const d = document.createElement("div"); d.textContent = String(s); return d.innerHTML; }
+load();
+setInterval(load, 10000);
+</script>
+</body>
+</html>

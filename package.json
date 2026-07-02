@@ -1,0 +1,29 @@
+{
+  "name": "feedback-intelligence",
+  "version": "1.0.0",
+  "description": "Customer Feedback Intelligence System: durable ingestion, queued LLM extraction with retry + DLQ, second-pass aggregation, leadership dashboard",
+  "type": "module",
+  "scripts": {
+    "start": "tsx src/server.ts",
+    "seed": "tsx src/seed.ts",
+    "test": "vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.32.0",
+    "better-sqlite3": "^11.5.0",
+    "fastify": "^5.1.0",
+    "@fastify/static": "^8.0.0"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
+    "@types/node": "^22.9.0",
+    "tsx": "^4.19.2",
+    "typescript": "^5.6.3",
+    "vitest": "^2.1.4"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "license": "MIT"
+}
